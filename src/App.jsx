@@ -28,13 +28,37 @@ const INCOME_CATEGORIES = [
   { key: 'outras_entradas',label: 'Outras Entradas',cat: 'Outras Entradas',color: '#6B7280', bg: '#F3F4F6' },
 ];
 
+// Quem pode ser dono de uma transação. Diferente das categorias
+// (que mudam com frequência via categoryRules vindas do backend),
+// as pessoas da casa são estáveis — fica simples aqui mesmo.
+const PEOPLE = [
+  { key: 'matheus',  label: 'Matheus' },
+  { key: 'juliana',  label: 'Juliana' },
+  { key: 'conjunta', label: 'Conjunta / Casa' },
+];
+const personLabel = (key) => PEOPLE.find(p => p.key === key)?.label ?? 'Conjunta / Casa';
+
 const BRL = (v) =>
   new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v ?? 0);
 
 const fmt = (date) => date?.split('-').reverse().join('/') ?? '-';
 
+/* ─── Categorização por regra ────────────────────────────
+   Fonte única: as regras vêm do backend (data.categoryRules,
+   editáveis em Configurações). Antes esse mapeamento existia
+   duplicado aqui, no import.js e no prompt do Gemini — agora
+   é uma função só, chamada de todo lugar que precisa sugerir
+   categoria a partir de um texto de extrato.
+──────────────────────────────────────────────────────── */
+function categorize(description, amount, rules) {
+  if (amount > 0) return 'Receita';
+  const nl = (description || '').toLowerCase();
+  const hit = (rules || []).find(r => nl.includes(r.keyword.toLowerCase()));
+  return hit ? hit.category : 'Outros';
+}
+
 /* ─── OFX Parser ─────────────────────────────────────── */
-function parseOFX(text) {
+function parseOFX(text, rules) {
   const blocks = text.split(/<STMTTRN>/i);
   return blocks.slice(1).map(b => {
     const tag = t => { const m = b.match(new RegExp(`<${t}>([^<\r\n]+)`, 'i')); return m ? m[1].trim() : ''; };
@@ -45,17 +69,8 @@ function parseOFX(text) {
     const amount = parseFloat(amtStr);
     let date = new Date().toISOString().split('T')[0];
     if (dateStr.length >= 8) date = `${dateStr.slice(0,4)}-${dateStr.slice(4,6)}-${dateStr.slice(6,8)}`;
-    const nl = name.toLowerCase();
-    let category = amount > 0 ? 'Receita' : 'Outros';
-    if (amount < 0) {
-      if (/aluguel|condominio|luz|agua|energia|gas/.test(nl)) category = 'Moradia';
-      else if (/supermercado|mercado|padaria|hortifruti|ifood|rappi/.test(nl)) category = 'Alimentação';
-      else if (/uber|99|combustivel|posto|gasolina|passagem/.test(nl)) category = 'Transporte';
-      else if (/farmacia|unimed|consulta|exame|saude/.test(nl)) category = 'Saúde';
-      else if (/netflix|spotify|cinema|restaurante|lazer/.test(nl)) category = 'Lazer';
-      else if (/invest|tesouro|cdb|poupan|corretora|b3/.test(nl)) category = 'Reserva Financeira';
-    }
-    return { id: Date.now() + Math.random(), date, description: name, amount, category, type: amount >= 0 ? 'income' : 'expense' };
+    const category = categorize(name, amount, rules);
+    return { id: Date.now() + Math.random(), date, description: name, amount, category, type: amount >= 0 ? 'income' : 'expense', person: 'conjunta' };
   }).filter(Boolean);
 }
 
@@ -64,7 +79,8 @@ function parseOFX(text) {
 ════════════════════════════════════════════════════════ */
 export default function App() {
   const [tab, setTab] = useState('dashboard');
-  const [data, setData] = useState({ transactions: [], goals: [], settings: {} });
+  const [data, setData] = useState({ transactions: [], goals: [], purchases: [], categoryRules: [], settings: {} });
+  const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState(null);
   const [expandedCat, setExpandedCat] = useState(null);
@@ -76,6 +92,20 @@ export default function App() {
   const [txAmount, setTxAmount] = useState('');
   const [txType,   setTxType]   = useState('expense');
   const [txCat,    setTxCat]    = useState('Outros');
+  const [txPerson, setTxPerson] = useState('conjunta');
+
+  // Parcelamento form
+  const [pDesc,    setPDesc]    = useState('');
+  const [pTotal,   setPTotal]   = useState('');
+  const [pCount,   setPCount]   = useState('');
+  const [pStartNum,setPStartNum]= useState('1');
+  const [pDate,    setPDate]    = useState(new Date().toISOString().split('T')[0]);
+  const [pCat,     setPCat]     = useState('Outros');
+  const [pPerson,  setPPerson]  = useState('conjunta');
+
+  // Regra de categorização
+  const [ruleKeyword,  setRuleKeyword]  = useState('');
+  const [ruleCategory, setRuleCategory] = useState('Outros');
 
   // Goal form
   const [gName,     setGName]     = useState('');
@@ -100,10 +130,12 @@ export default function App() {
   const [aiParsing,  setAiParsing]  = useState(false);
   const [imported,   setImported]   = useState([]);
   const [ofxName,    setOfxName]    = useState('');
+  const [importPerson, setImportPerson] = useState('conjunta');
 
   // Filters
-  const [fMonth, setFMonth] = useState('all');
-  const [fCat,   setFCat]   = useState('all');
+  const [fMonth,  setFMonth]  = useState('all');
+  const [fCat,    setFCat]    = useState('all');
+  const [fPerson, setFPerson] = useState('all');
 
   // Coach
   const [advice,        setAdvice]        = useState('');
@@ -130,6 +162,9 @@ export default function App() {
       setLimReserva(cb.reserva ?? 0);
       setLimDizimo(cb.dizimo ?? 0);
       setLimOutros(cb.outros ?? 0);
+      // Números determinísticos do painel — não passam por IA.
+      const sumRes = await fetch('/api/summary');
+      if (sumRes.ok) setSummary(await sumRes.json());
     } catch {
       setError('Não foi possível conectar ao servidor local (localhost:3010).');
     } finally { setLoading(false); }
@@ -151,8 +186,9 @@ export default function App() {
 
   const months   = [...new Set(data.transactions.map(t => t.date?.slice(0,7)).filter(Boolean))].sort().reverse();
   const filtered = data.transactions.filter(t =>
-    (fMonth === 'all' || t.date?.startsWith(fMonth)) &&
-    (fCat   === 'all' || t.category === fCat)
+    (fMonth  === 'all' || t.date?.startsWith(fMonth)) &&
+    (fCat    === 'all' || t.category === fCat) &&
+    (fPerson === 'all' || (t.person || 'conjunta') === fPerson)
   );
 
   /* ── API helpers ── */
@@ -163,9 +199,38 @@ export default function App() {
   const addTx = async (e) => {
     e.preventDefault();
     const amount = parseFloat(txAmount) * (txType === 'expense' ? -1 : 1);
-    await postJSON('/api/transactions', { date: txDate, description: txDesc, amount, category: txType === 'income' ? 'Receita' : txCat, type: txType });
+    await postJSON('/api/transactions', { date: txDate, description: txDesc, amount, category: txType === 'income' ? 'Receita' : txCat, type: txType, person: txPerson });
     setTxDesc(''); setTxAmount(''); fetchData();
   };
+
+  /* ── Parcelamento: cria a compra + as N transações-parcela linkadas ── */
+  const addPurchase = async (e) => {
+    e.preventDefault();
+    await postJSON('/api/purchases', {
+      description: pDesc, totalAmount: +pTotal, installmentCount: +pCount,
+      startInstallmentNumber: +pStartNum || 1, startDate: pDate, category: pCat, person: pPerson
+    });
+    setPDesc(''); setPTotal(''); setPCount(''); setPStartNum('1'); fetchData();
+  };
+
+  const deletePurchase = async (id) => {
+    if (!confirm('Remover este parcelamento? As parcelas futuras (ainda não vencidas) serão apagadas do extrato — as já pagas permanecem.')) return;
+    await del(`/api/purchases/${id}`); fetchData();
+  };
+
+  /* ── Regras de categorização (substituem os regex hardcoded) ── */
+  const addRule = async (e) => {
+    e.preventDefault();
+    if (!ruleKeyword.trim()) return;
+    await postJSON('/api/category-rules', { keyword: ruleKeyword, category: ruleCategory });
+    setRuleKeyword(''); fetchData();
+  };
+
+  const deleteRule = async (id) => { await del(`/api/category-rules/${id}`); fetchData(); };
+
+  /* ── Reclassificação rápida (usada na fila de classificação) ── */
+  const reclassify = async (id, category) => { await putJSON(`/api/transactions/${id}`, { category }); fetchData(); };
+  const reassignPerson = async (id, person) => { await putJSON(`/api/transactions/${id}`, { person }); fetchData(); };
 
   const deleteTx = async (id) => { if (!confirm('Remover transação?')) return; await del(`/api/transactions/${id}`); fetchData(); };
 
@@ -198,19 +263,12 @@ export default function App() {
     if (!pastedText.trim()) return;
     setAiParsing(true);
     try {
-      const res  = await postJSON('/api/analyze-statement', { text: pastedText });
+      const res  = await postJSON('/api/analyze-statement', { text: pastedText, defaultPerson: importPerson });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error);
       setImported(json.transactions.map(t => ({ ...t, id: Date.now() + Math.random() })));
     } catch (err) { alert('Erro IA: ' + err.message); }
     finally { setAiParsing(false); }
-  };
-
-  const saveImported = async () => {
-    for (const tx of imported) await postJSON('/api/transactions', tx);
-    alert(`${imported.length} transações importadas!`);
-    setImported([]); setPastedText(''); setOfxName('');
-    fetchData(); setTab('dashboard');
   };
 
   const editImported = (id, field, value) => setImported(prev => prev.map(t => {
@@ -220,13 +278,46 @@ export default function App() {
     return { ...t, [field]: value };
   }));
 
+  // Junta parcelas do mesmo lote de importação (mesma descrição-base,
+  // mesmo installmentTotal) numa Purchase, em vez de salvar N transações
+  // soltas sem vínculo entre si — é isso que dá o "quanto falta" de graça.
+  const saveImportedWithInstallments = async () => {
+    const grouped = {};
+    const standalone = [];
+    imported.forEach(t => {
+      if (t.installment?.total) {
+        const baseDesc = t.description.replace(/\s*\(?Parcela\s*\d+\/\d+\)?/i, '').trim();
+        const key = `${baseDesc}__${t.installment.total}`;
+        if (!grouped[key]) grouped[key] = { baseDesc, ...t, items: [] };
+        grouped[key].items.push(t);
+      } else {
+        standalone.push(t);
+      }
+    });
+    for (const tx of standalone) await postJSON('/api/transactions', tx);
+    for (const g of Object.values(grouped)) {
+      const monthly = Math.abs(g.items[0].amount);
+      const firstNumber = Math.min(...g.items.map(i => i.installment.number));
+      await postJSON('/api/purchases', {
+        description: g.baseDesc, totalAmount: monthly * g.items[0].installment.total,
+        installmentCount: g.items[0].installment.total, startInstallmentNumber: firstNumber,
+        startDate: g.items.sort((a,b)=>a.installment.number-b.installment.number)[0].date,
+        category: g.category, person: g.person
+      });
+    }
+    alert(`${imported.length} transações importadas!`);
+    setImported([]); setPastedText(''); setOfxName('');
+    fetchData(); setTab('dashboard');
+  };
+
   const consultCoach = async () => {
     setLoadingAdvice(true); setAdvice('');
     try {
       const res  = await fetch('/api/coach-advice', { method: 'POST' });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error);
-      setAdvice(json.advice);
+      if (json.metrics) setSummary(json.metrics); // números já vinham prontos do backend
+      setAdvice(json.advice || (json.aiUnavailable ? '⚠️ IA não configurada no servidor — mas os números acima do painel já são calculados sem ela.' : ''));
     } catch (err) { setAdvice('⚠️ ' + err.message); }
     finally { setLoadingAdvice(false); }
   };
@@ -258,6 +349,7 @@ export default function App() {
     { id: 'dashboard', icon: <Compass size={13}/>,      label: 'Painel'         },
     { id: 'income-strategy', icon: <TrendingUp size={13}/>, label: 'Inteligência de Renda' },
     { id: 'history',   icon: <Layers size={13}/>,       label: 'Extrato'        },
+    { id: 'installments', icon: <FileText size={13}/>,  label: 'Parcelamentos'  },
     { id: 'import',    icon: <Upload size={13}/>,        label: 'Importar'       },
     { id: 'goals',     icon: <PiggyBank size={13}/>,     label: 'Metas'          },
     { id: 'coach',     icon: <Sparkles size={13}/>,      label: 'Assistente IA' },
@@ -363,6 +455,74 @@ export default function App() {
                         <DollarSign size={19} color="var(--blue-500)" />
                       </div>
                     </div>
+                  </div>
+                </div>
+
+                {/* ── Auditoria rápida: parcelas em aberto + fila de classificação ──
+                     Números 100% determinísticos (vêm de /api/summary), sem IA. */}
+                <div className="grid-2">
+                  <div className="card">
+                    <h3 className="sec-title"><Layers size={15} color="var(--purple-700)" /> Parcelas em Aberto</h3>
+                    {!summary || summary.openInstallments.length === 0 ? (
+                      <div className="empty-state" style={{ padding: '1.5rem 1rem' }}>
+                        <p>Nenhum parcelamento em aberto. Registre um na aba Parcelamentos.</p>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="summary-row" style={{ marginBottom: '1rem', background: 'var(--bg-subtle)', padding: '.75rem 1rem', borderRadius: 8 }}>
+                          <div className="summary-item">
+                            <p className="summary-label">Comprometido / mês (enquanto durar)</p>
+                            <p className="summary-value" style={{ color: 'var(--red-500)' }}>{BRL(summary.committedInstallmentsPerMonth)}</p>
+                          </div>
+                        </div>
+                        {summary.openInstallments.slice(0, 5).map(p => (
+                          <div key={p.purchaseId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.5rem 0', borderBottom: '1px solid var(--bg-subtle)', fontSize: '.83rem' }}>
+                            <div style={{ overflow: 'hidden' }}>
+                              <div style={{ fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.description}</div>
+                              <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>faltam {p.remainingCount}x de {BRL(p.monthlyAmount)} · quita em {fmt(p.finishesOn)}</div>
+                            </div>
+                            <div style={{ fontWeight: 700, color: 'var(--red-500)', whiteSpace: 'nowrap', marginLeft: '.75rem' }}>{BRL(p.remainingTotal)}</div>
+                          </div>
+                        ))}
+                        {summary.openInstallments.length > 5 && (
+                          <button className="btn btn-secondary btn-full" style={{ marginTop: '1rem' }} onClick={() => setTab('installments')}>
+                            Ver todos ({summary.openInstallments.length}) <ChevronRight size={14} />
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+
+                  <div className="card">
+                    <h3 className="sec-title"><AlertCircle size={15} color="var(--gold-700)" /> Fila de Classificação</h3>
+                    {!summary || summary.unclassified.count === 0 ? (
+                      <div className="empty-state" style={{ padding: '1.5rem 1rem' }}>
+                        <Check size={28} />
+                        <p>Tudo classificado — nada esperando revisão.</p>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="alert alert-warning" style={{ marginBottom: '1rem' }}>
+                          <AlertCircle size={15} style={{ flexShrink: 0 }} />
+                          <span>{summary.unclassified.count} transações somando {BRL(summary.unclassified.total)} em "Outros" ou sem pessoa definida.</span>
+                        </div>
+                        {summary.unclassified.items.slice(0, 5).map(t => (
+                          <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: '.5rem', padding: '.5rem 0', borderBottom: '1px solid var(--bg-subtle)', fontSize: '.8rem' }}>
+                            <span style={{ flex: 1, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }} title={t.description}>{t.description}</span>
+                            <span style={{ fontWeight: 600, color: 'var(--red-500)', whiteSpace: 'nowrap' }}>{BRL(t.amount)}</span>
+                            <select className="form-input" style={{ padding: '.25rem', fontSize: '.72rem', width: 110 }} value={t.category} onChange={e => reclassify(t.id, e.target.value)}>
+                              {ENVELOPES.map(e => <option key={e.key} value={e.cat}>{e.label}</option>)}
+                            </select>
+                            <select className="form-input" style={{ padding: '.25rem', fontSize: '.72rem', width: 90 }} value={t.person || 'conjunta'} onChange={e => reassignPerson(t.id, e.target.value)}>
+                              {PEOPLE.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+                            </select>
+                          </div>
+                        ))}
+                        {summary.unclassified.count > 5 && (
+                          <p style={{ fontSize: '.75rem', color: 'var(--text-3)', marginTop: '.75rem' }}>+{summary.unclassified.count - 5} outras no Extrato (filtre por categoria "Outros").</p>
+                        )}
+                      </>
+                    )}
                   </div>
                 </div>
 
@@ -555,6 +715,12 @@ export default function App() {
                             </select>
                           </div>
                         )}
+                      </div>
+                      <div className="form-group">
+                        <label className="form-label">Pessoa</label>
+                        <select className="form-input" value={txPerson} onChange={e => setTxPerson(e.target.value)}>
+                          {PEOPLE.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+                        </select>
                       </div>
                       <button type="submit" className="btn btn-primary btn-full">
                         <Plus size={15} /> Salvar Lançamento
@@ -769,6 +935,10 @@ export default function App() {
                       <option value="all">Todas as categorias</option>
                       {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
                     </select>
+                    <select className="form-input" style={{ width: 'auto' }} value={fPerson} onChange={e => setFPerson(e.target.value)}>
+                      <option value="all">Todas as pessoas</option>
+                      {PEOPLE.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+                    </select>
                   </div>
                 </div>
 
@@ -778,7 +948,7 @@ export default function App() {
                   <div className="table-wrap">
                     <table className="data-table">
                       <thead>
-                        <tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Valor</th><th style={{ width: 52, textAlign: 'center' }}></th></tr>
+                        <tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Pessoa</th><th>Parcela</th><th>Valor</th><th style={{ width: 52, textAlign: 'center' }}></th></tr>
                       </thead>
                       <tbody>
                         {filtered.map(t => (
@@ -786,6 +956,8 @@ export default function App() {
                             <td style={{ color: 'var(--text-3)', whiteSpace: 'nowrap', fontSize: '.8rem' }}>{fmt(t.date)}</td>
                             <td style={{ fontWeight: 500 }}>{t.description}</td>
                             <td><span className={badgeClass(t.category)}>{t.category}</span></td>
+                            <td style={{ fontSize: '.8rem', color: 'var(--text-2)' }}>{personLabel(t.person)}</td>
+                            <td style={{ fontSize: '.78rem', color: 'var(--text-3)', whiteSpace: 'nowrap' }}>{t.installment ? `${t.installment.number}/${t.installment.total}` : '—'}</td>
                             <td style={{ fontWeight: 700, color: t.type === 'income' ? 'var(--green-700)' : 'var(--red-500)', whiteSpace: 'nowrap' }}>
                               {t.type === 'income' ? '+' : ''}{BRL(t.amount)}
                             </td>
@@ -801,12 +973,88 @@ export default function App() {
               </div>
             )}
 
+            {/* ════════════ PARCELAMENTOS ════════════
+                 Cada compra parcelada vira uma entidade com N
+                 transações-filha linkadas — "quanto falta" e
+                 "quando acaba" são leitura direta, não reconstrução
+                 manual de texto de fatura. */}
+            {tab === 'installments' && (
+              <div className="fade-in grid-2">
+                <div className="card">
+                  <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.25rem', marginBottom: '.3rem' }}>Parcelamentos em Aberto</h2>
+                  <p style={{ fontSize: '.82rem', marginBottom: '1.25rem' }}>Tudo que ainda está comprometido em compras parceladas, ordenado do que quita primeiro pro que demora mais.</p>
+                  {!summary || summary.openInstallments.length === 0 ? (
+                    <div className="empty-state"><Layers size={34} /><p>Nenhum parcelamento em aberto.</p></div>
+                  ) : (
+                    <div>
+                      {summary.openInstallments.map(p => (
+                        <div key={p.purchaseId} className="goal-card">
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '.4rem' }}>
+                            <div>
+                              <p style={{ fontWeight: 600, fontSize: '.88rem' }}>{p.description}</p>
+                              <p style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: '.1rem' }}>
+                                {personLabel(p.person)} · {p.category} · paga {p.paidCount}/{p.installmentCount} · quita em {fmt(p.finishesOn)}
+                              </p>
+                            </div>
+                            <button className="btn btn-danger" onClick={() => deletePurchase(p.purchaseId)}><Trash2 size={13} /></button>
+                          </div>
+                          <div className="progress-track"><div className="progress-fill" style={{ width: `${(p.paidCount/p.installmentCount)*100}%`, background: 'var(--purple-700)' }} /></div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '.6rem' }}>
+                            <span style={{ fontSize: '.77rem', color: 'var(--text-2)' }}>{BRL(p.monthlyAmount)}/mês · faltam {p.remainingCount}x</span>
+                            <span style={{ fontWeight: 700, fontSize: '.85rem', color: 'var(--red-500)' }}>{BRL(p.remainingTotal)} restantes</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="card">
+                  <h3 className="sec-title"><Plus size={15} color="var(--blue-500)" /> Registrar Parcelamento</h3>
+                  <p style={{ fontSize: '.78rem', marginBottom: '1rem', color: 'var(--text-3)' }}>Serve tanto pra compra nova quanto pra uma que já está em andamento — só ajustar "parcela inicial".</p>
+                  <form onSubmit={addPurchase}>
+                    <div className="form-group"><label className="form-label">Descrição</label><input type="text" className="form-input" placeholder="Ex: Capacete, Curso, Dívida moto..." value={pDesc} onChange={e => setPDesc(e.target.value)} required /></div>
+                    <div className="form-row">
+                      <div className="form-group"><label className="form-label">Valor total da compra (R$)</label><input type="number" step="0.01" className="form-input" value={pTotal} onChange={e => setPTotal(e.target.value)} required /></div>
+                      <div className="form-group"><label className="form-label">Nº total de parcelas</label><input type="number" min="1" className="form-input" value={pCount} onChange={e => setPCount(e.target.value)} required /></div>
+                    </div>
+                    <div className="form-row">
+                      <div className="form-group"><label className="form-label">Parcela inicial (se já em andamento)</label><input type="number" min="1" className="form-input" value={pStartNum} onChange={e => setPStartNum(e.target.value)} /></div>
+                      <div className="form-group"><label className="form-label">Data desta parcela</label><input type="date" className="form-input" value={pDate} onChange={e => setPDate(e.target.value)} required /></div>
+                    </div>
+                    <div className="form-row">
+                      <div className="form-group">
+                        <label className="form-label">Categoria</label>
+                        <select className="form-input" value={pCat} onChange={e => setPCat(e.target.value)}>
+                          {ENVELOPES.map(e => <option key={e.key} value={e.cat}>{e.label}</option>)}
+                        </select>
+                      </div>
+                      <div className="form-group">
+                        <label className="form-label">Pessoa</label>
+                        <select className="form-input" value={pPerson} onChange={e => setPPerson(e.target.value)}>
+                          {PEOPLE.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+                        </select>
+                      </div>
+                    </div>
+                    <button type="submit" className="btn btn-primary btn-full"><Plus size={15} /> Registrar Parcelamento</button>
+                  </form>
+                </div>
+              </div>
+            )}
+
             {/* ════════════ IMPORTAR ════════════ */}
             {tab === 'import' && (
               <div className="fade-in grid-2">
                 <div className="card">
                   <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.25rem', marginBottom: '.3rem' }}>Importador Inteligente</h2>
-                  <p style={{ fontSize: '.82rem', marginBottom: '1.4rem' }}>Suba extratos bancários sem complicações.</p>
+                  <p style={{ fontSize: '.82rem', marginBottom: '1rem' }}>Suba extratos bancários sem complicações.</p>
+
+                  <div className="form-group" style={{ marginBottom: '1.25rem' }}>
+                    <label className="form-label">De quem é este extrato?</label>
+                    <select className="form-input" value={importPerson} onChange={e => setImportPerson(e.target.value)}>
+                      {PEOPLE.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+                    </select>
+                  </div>
 
                   <p className="form-label">Opção A — Arquivo .OFX</p>
                   <div className="dropzone" style={{ marginBottom: '1.4rem' }}>
@@ -819,7 +1067,7 @@ export default function App() {
                       const f = e.target.files[0]; if (!f) return;
                       setOfxName(f.name);
                       const r = new FileReader();
-                      r.onload = ev => setImported(parseOFX(ev.target.result));
+                      r.onload = ev => setImported(parseOFX(ev.target.result, data.categoryRules).map(t => ({ ...t, person: importPerson })));
                       r.readAsText(f);
                     }} style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', width: '100%', height: '100%' }} />
                     {ofxName && (
@@ -856,7 +1104,7 @@ export default function App() {
                       <div style={{ flex: 1, overflow: 'auto', maxHeight: 360 }}>
                         <div className="table-wrap">
                           <table className="data-table" style={{ fontSize: '.78rem' }}>
-                            <thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Valor</th><th /></tr></thead>
+                            <thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Pessoa</th><th>Parcela</th><th>Valor</th><th /></tr></thead>
                             <tbody>
                               {imported.map(t => (
                                 <tr key={t.id}>
@@ -867,6 +1115,12 @@ export default function App() {
                                       {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
                                     </select>
                                   </td>
+                                  <td>
+                                    <select className="form-input" style={{ padding: '.3rem', fontSize: '.75rem' }} value={t.person || 'conjunta'} onChange={e => editImported(t.id,'person',e.target.value)}>
+                                      {PEOPLE.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+                                    </select>
+                                  </td>
+                                  <td style={{ whiteSpace: 'nowrap', color: 'var(--text-3)' }}>{t.installment ? `${t.installment.number}/${t.installment.total}` : '—'}</td>
                                   <td><input type="number" className="form-input" style={{ padding: '.3rem', fontSize: '.75rem', width: 80 }} value={Math.abs(t.amount)} onChange={e => editImported(t.id,'amount',t.type==='expense'?-e.target.value:e.target.value)} /></td>
                                   <td><button className="btn btn-danger" onClick={() => setImported(p => p.filter(x => x.id !== t.id))}><X size={12} /></button></td>
                                 </tr>
@@ -877,7 +1131,7 @@ export default function App() {
                       </div>
                       <div style={{ display: 'flex', gap: '.7rem', marginTop: '1rem' }}>
                         <button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setImported([])}>Descartar</button>
-                        <button className="btn btn-primary" style={{ flex: 2 }} onClick={saveImported}>Confirmar e Importar</button>
+                        <button className="btn btn-primary" style={{ flex: 2 }} onClick={saveImportedWithInstallments}>Confirmar e Importar</button>
                       </div>
                     </>
                   )}
@@ -1024,6 +1278,48 @@ export default function App() {
 
                     <button type="submit" className="btn btn-primary">Salvar Configurações</button>
                   </form>
+                </div>
+
+                {/* Regras de categorização — fonte única, editável aqui.
+                     Antes esse mapeamento existia duplicado (parseOFX em
+                     App.jsx, import.js, e o prompt do Gemini), o que gerava
+                     categorização divergente entre eles. */}
+                <div className="card" style={{ maxWidth: 640, marginTop: '1.5rem' }}>
+                  <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.25rem', marginBottom: '.3rem' }}>Regras de Categorização</h2>
+                  <p style={{ fontSize: '.82rem', marginBottom: '1.25rem' }}>Quando uma descrição contém a palavra-chave, a categoria é aplicada automaticamente — no OFX, no colar de texto e na conferência da IA.</p>
+
+                  <form onSubmit={addRule} className="form-row" style={{ alignItems: 'flex-end', marginBottom: '1.25rem' }}>
+                    <div className="form-group">
+                      <label className="form-label">Palavra-chave contém</label>
+                      <input type="text" className="form-input" placeholder="Ex: wms supermercados" value={ruleKeyword} onChange={e => setRuleKeyword(e.target.value)} required />
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">Vira categoria</label>
+                      <select className="form-input" value={ruleCategory} onChange={e => setRuleCategory(e.target.value)}>
+                        {ENVELOPES.map(e => <option key={e.key} value={e.cat}>{e.label}</option>)}
+                      </select>
+                    </div>
+                    <button type="submit" className="btn btn-primary" style={{ height: 38 }}><Plus size={15} /></button>
+                  </form>
+
+                  {(data.categoryRules || []).length === 0 ? (
+                    <div className="empty-state" style={{ padding: '1.5rem 1rem' }}><p>Nenhuma regra cadastrada.</p></div>
+                  ) : (
+                    <div className="table-wrap">
+                      <table className="data-table" style={{ fontSize: '.82rem' }}>
+                        <thead><tr><th>Contém</th><th>Categoria</th><th /></tr></thead>
+                        <tbody>
+                          {data.categoryRules.map(r => (
+                            <tr key={r.id}>
+                              <td>{r.keyword}</td>
+                              <td><span className={badgeClass(r.category)}>{r.category}</span></td>
+                              <td style={{ textAlign: 'center' }}><button className="btn btn-danger" onClick={() => deleteRule(r.id)}><Trash2 size={13} /></button></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
               </div>
             )}

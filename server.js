@@ -19,10 +19,70 @@ const DB_FILE = path.join(__dirname, 'db.json');
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Initialize db.json if not present
+/* ─────────────────────────────────────────────────────────
+   MODELO DE DADO
+   - people: quem pode ser dono de uma transação
+   - categoryRules: substituem os regex duplicados que existiam
+     em App.jsx (parseOFX), import.js e no prompt do Gemini.
+     Uma única fonte de verdade, editável pelo painel.
+   - purchases: uma compra parcelada é uma entidade própria —
+     as N transações-parcela nascem linkadas a ela por
+     transaction.installment.purchaseId, então "quanto falta"
+     e "quando acaba" são cálculo determinístico, não
+     reconstrução manual de texto de fatura.
+───────────────────────────────────────────────────────── */
+const DEFAULT_PEOPLE = [
+  { key: 'matheus',  label: 'Matheus' },
+  { key: 'juliana',  label: 'Juliana' },
+  { key: 'conjunta', label: 'Conjunta / Casa' },
+];
+
+// Seed equivalente às regras de regex que estavam espalhadas em
+// App.jsx, import.js e no prompt do Gemini — agora centralizadas
+// e editáveis em Configurações, em vez de hardcoded em 3 lugares.
+const DEFAULT_CATEGORY_RULES = [
+  { id: 'r1',  keyword: 'aluguel',       category: 'Moradia' },
+  { id: 'r2',  keyword: 'condomini',     category: 'Moradia' },
+  { id: 'r3',  keyword: 'luz',           category: 'Moradia' },
+  { id: 'r4',  keyword: 'energia',       category: 'Moradia' },
+  { id: 'r5',  keyword: 'enel',          category: 'Moradia' },
+  { id: 'r6',  keyword: 'claro',         category: 'Moradia' },
+  { id: 'r7',  keyword: 'agua',          category: 'Moradia' },
+  { id: 'r8',  keyword: 'supermercado',  category: 'Alimentação' },
+  { id: 'r9',  keyword: 'mercado',       category: 'Alimentação' },
+  { id: 'r10', keyword: 'padaria',       category: 'Alimentação' },
+  { id: 'r11', keyword: 'ifood',         category: 'Alimentação' },
+  { id: 'r12', keyword: 'rappi',         category: 'Alimentação' },
+  { id: 'r13', keyword: 'hortifruti',    category: 'Alimentação' },
+  { id: 'r14', keyword: 'uber',          category: 'Transporte' },
+  { id: 'r15', keyword: '99',            category: 'Transporte' },
+  { id: 'r16', keyword: 'posto',         category: 'Transporte' },
+  { id: 'r17', keyword: 'combustivel',   category: 'Transporte' },
+  { id: 'r18', keyword: 'gasolina',      category: 'Transporte' },
+  { id: 'r19', keyword: 'bilhete unico', category: 'Transporte' },
+  { id: 'r20', keyword: 'pedagio',       category: 'Transporte' },
+  { id: 'r21', keyword: 'farmacia',      category: 'Saúde' },
+  { id: 'r22', keyword: 'drogaria',      category: 'Saúde' },
+  { id: 'r23', keyword: 'consulta',      category: 'Saúde' },
+  { id: 'r24', keyword: 'dentista',      category: 'Saúde' },
+  { id: 'r25', keyword: 'netflix',       category: 'Lazer' },
+  { id: 'r26', keyword: 'spotify',       category: 'Lazer' },
+  { id: 'r27', keyword: 'cinema',        category: 'Lazer' },
+  { id: 'r28', keyword: 'restaurante',   category: 'Lazer' },
+  { id: 'r29', keyword: 'tesouro',       category: 'Reserva Financeira' },
+  { id: 'r30', keyword: 'cdb',           category: 'Reserva Financeira' },
+  { id: 'r31', keyword: 'corretora',     category: 'Reserva Financeira' },
+  { id: 'r32', keyword: 'dizimo',        category: 'Dízimo' },
+  { id: 'r33', keyword: 'rendimento',    category: 'Rendimentos' },
+  { id: 'r34', keyword: 'reembolso',     category: 'Reembolsos' },
+];
+
 const initialDb = {
   transactions: [],
   goals: [],
+  purchases: [],
+  people: DEFAULT_PEOPLE,
+  categoryRules: DEFAULT_CATEGORY_RULES,
   settings: {
     familyName: "Usuário",
     monthlyBudget: 10000,
@@ -45,7 +105,12 @@ function readDb() {
       return initialDb;
     }
     const content = fs.readFileSync(DB_FILE, 'utf-8');
-    return JSON.parse(content);
+    const db = JSON.parse(content);
+    // Migração leve: bancos antigos podem não ter os campos novos.
+    if (!db.purchases) db.purchases = [];
+    if (!db.people) db.people = DEFAULT_PEOPLE;
+    if (!db.categoryRules) db.categoryRules = DEFAULT_CATEGORY_RULES;
+    return db;
   } catch (err) {
     console.error("Erro ao ler db.json, usando dados iniciais:", err);
     return initialDb;
@@ -62,9 +127,121 @@ function writeDb(data) {
   }
 }
 
-// REST API Endpoints
+/* ─────────────────────────────────────────────────────────
+   Categorização por regra — substitui o regex duplicado.
+───────────────────────────────────────────────────────── */
+function applyCategoryRules(description, rules, fallback) {
+  const nl = (description || '').toLowerCase();
+  const hit = rules.find(r => nl.includes(r.keyword.toLowerCase()));
+  return hit ? hit.category : fallback;
+}
+
+/* ─────────────────────────────────────────────────────────
+   Métricas determinísticas — nada disso passa por IA.
+   Usado tanto por /api/summary (painel) quanto por
+   /api/coach-advice (que agora só narra em cima destes
+   números já prontos, em vez de "calcular" dentro do prompt).
+───────────────────────────────────────────────────────── */
+function computeMetrics(db) {
+  const today = new Date().toISOString().split('T')[0];
+  const tx = db.transactions;
+
+  const sum = (list) => list.reduce((s, t) => s + Math.abs(t.amount), 0);
+
+  const totalIncome  = sum(tx.filter(t => t.type === 'income'));
+  const totalExpense = sum(tx.filter(t => t.type === 'expense'));
+  const netBalance   = totalIncome - totalExpense;
+
+  const byCategory = {};
+  tx.filter(t => t.type === 'expense').forEach(t => {
+    byCategory[t.category] = (byCategory[t.category] || 0) + Math.abs(t.amount);
+  });
+
+  const byPerson = {};
+  tx.filter(t => t.type === 'expense').forEach(t => {
+    const p = t.person || 'conjunta';
+    byPerson[p] = (byPerson[p] || 0) + Math.abs(t.amount);
+  });
+
+  const byMonth = {};
+  tx.forEach(t => {
+    const m = (t.date || '').slice(0, 7);
+    if (!m) return;
+    if (!byMonth[m]) byMonth[m] = { income: 0, expense: 0 };
+    if (t.type === 'income') byMonth[m].income += t.amount;
+    if (t.type === 'expense') byMonth[m].expense += Math.abs(t.amount);
+  });
+
+  const cb = db.settings?.categoryBudgets || {};
+  const budgetKeyMap = {
+    'Moradia': 'moradia', 'Alimentação': 'alimentacao', 'Transporte': 'transporte',
+    'Saúde': 'saude', 'Lazer': 'lazer', 'Reserva Financeira': 'reserva',
+    'Dízimo': 'dizimo', 'Outros': 'outros'
+  };
+  const budgetVsActual = Object.entries(budgetKeyMap).map(([cat, key]) => ({
+    category: cat,
+    budget: cb[key] || 0,
+    actual: byCategory[cat] || 0,
+    over: (byCategory[cat] || 0) > (cb[key] || 0) && (cb[key] || 0) > 0
+  }));
+
+  // Parcelas em aberto: derivado 100% das transações-filha de cada
+  // compra, comparando a data de cada parcela com hoje. Nada aqui
+  // é reconstruído manualmente lendo texto de fatura.
+  const openInstallments = db.purchases.map(p => {
+    const children = tx
+      .filter(t => t.installment?.purchaseId === p.id)
+      .sort((a, b) => a.installment.number - b.installment.number);
+    const paid = children.filter(t => t.date <= today);
+    const remaining = children.filter(t => t.date > today);
+    const monthlyAmount = children[0] ? Math.abs(children[0].amount) : 0;
+    return {
+      purchaseId: p.id,
+      description: p.description,
+      category: p.category,
+      person: p.person,
+      installmentCount: p.installmentCount,
+      paidCount: paid.length,
+      remainingCount: remaining.length,
+      monthlyAmount,
+      remainingTotal: remaining.reduce((s, t) => s + Math.abs(t.amount), 0),
+      finishesOn: children.length ? children[children.length - 1].date : null,
+      done: remaining.length === 0
+    };
+  }).filter(p => !p.done);
+  openInstallments.sort((a, b) => a.remainingCount - b.remainingCount);
+
+  const committedInstallmentsPerMonth = openInstallments.reduce((s, p) => s + p.monthlyAmount, 0);
+
+  // Fila de classificação: tudo que caiu em categoria genérica
+  // ("Outros"/"Outras Despesas") ou sem pessoa definida — fica
+  // visível no painel em vez de acumular silenciosamente.
+  const unclassified = tx.filter(t =>
+    t.type === 'expense' && (t.category === 'Outros' || t.category === 'Outras Despesas' || !t.person)
+  );
+
+  return {
+    totalIncome, totalExpense, netBalance,
+    savingsRate: totalIncome > 0 ? Math.max(0, netBalance / totalIncome * 100) : 0,
+    byCategory, byPerson, byMonth,
+    budgetVsActual,
+    openInstallments,
+    committedInstallmentsPerMonth,
+    unclassified: {
+      count: unclassified.length,
+      total: sum(unclassified),
+      items: unclassified
+    }
+  };
+}
+
+/* ═════════════════ REST API — Core ═════════════════ */
 app.get('/api/data', (req, res) => {
   res.json(readDb());
+});
+
+app.get('/api/summary', (req, res) => {
+  res.json(computeMetrics(readDb()));
 });
 
 app.post('/api/transactions', (req, res) => {
@@ -75,7 +252,9 @@ app.post('/api/transactions', (req, res) => {
     description: req.body.description,
     amount: parseFloat(req.body.amount),
     category: req.body.category || 'Outros',
-    type: req.body.type || (parseFloat(req.body.amount) >= 0 ? 'income' : 'expense')
+    type: req.body.type || (parseFloat(req.body.amount) >= 0 ? 'income' : 'expense'),
+    person: req.body.person || 'conjunta',
+    installment: req.body.installment || null
   };
   db.transactions.unshift(newTx);
   writeDb(db);
@@ -106,7 +285,7 @@ app.delete('/api/transactions/:id', (req, res) => {
   }
 });
 
-// Goals Endpoints
+/* ═════════════════ Goals ═════════════════ */
 app.post('/api/goals', (req, res) => {
   const db = readDb();
   const newGoal = {
@@ -145,7 +324,88 @@ app.delete('/api/goals/:id', (req, res) => {
   }
 });
 
-// Settings Endpoints
+/* ═════════════════ Category Rules ═════════════════ */
+app.post('/api/category-rules', (req, res) => {
+  const db = readDb();
+  const rule = { id: Date.now().toString(), keyword: (req.body.keyword || '').trim(), category: req.body.category };
+  if (!rule.keyword || !rule.category) return res.status(400).json({ error: 'keyword e category são obrigatórios' });
+  db.categoryRules.push(rule);
+  writeDb(db);
+  res.status(201).json(rule);
+});
+
+app.delete('/api/category-rules/:id', (req, res) => {
+  const db = readDb();
+  db.categoryRules = db.categoryRules.filter(r => r.id !== req.params.id);
+  writeDb(db);
+  res.json({ success: true });
+});
+
+/* ═════════════════ Purchases (parcelamento) ═════════════════
+   Cria a compra + todas as N transações-parcela já linkadas.
+   Permite registrar uma compra que já estava em andamento
+   (ex: "8/12, faltam 4") via startInstallmentNumber.
+─────────────────────────────────────────────────────────── */
+app.post('/api/purchases', (req, res) => {
+  const db = readDb();
+  const {
+    description, totalAmount, installmentCount,
+    startDate, category, person,
+    startInstallmentNumber
+  } = req.body;
+
+  if (!description || !totalAmount || !installmentCount || !startDate) {
+    return res.status(400).json({ error: 'description, totalAmount, installmentCount e startDate são obrigatórios' });
+  }
+
+  const purchase = {
+    id: Date.now().toString(),
+    description,
+    totalAmount: parseFloat(totalAmount),
+    installmentCount: parseInt(installmentCount, 10),
+    startDate,
+    category: category || 'Outros',
+    person: person || 'conjunta'
+  };
+
+  const firstNumber = startInstallmentNumber ? parseInt(startInstallmentNumber, 10) : 1;
+  const monthlyAmount = Math.round((purchase.totalAmount / purchase.installmentCount) * 100) / 100;
+
+  const newTx = [];
+  for (let n = firstNumber; n <= purchase.installmentCount; n++) {
+    const d = new Date(startDate + 'T00:00:00');
+    d.setMonth(d.getMonth() + (n - firstNumber));
+    newTx.push({
+      id: Date.now().toString() + '-' + n,
+      date: d.toISOString().split('T')[0],
+      description: `${description} (Parcela ${n}/${purchase.installmentCount})`,
+      amount: -monthlyAmount,
+      category: purchase.category,
+      type: 'expense',
+      person: purchase.person,
+      installment: { purchaseId: purchase.id, number: n, total: purchase.installmentCount }
+    });
+  }
+
+  db.purchases.push(purchase);
+  db.transactions.unshift(...newTx);
+  writeDb(db);
+  res.status(201).json({ purchase, transactions: newTx });
+});
+
+app.delete('/api/purchases/:id', (req, res) => {
+  const db = readDb();
+  db.purchases = db.purchases.filter(p => p.id !== req.params.id);
+  // Remove só as parcelas futuras (o histórico já pago permanece no extrato).
+  const today = new Date().toISOString().split('T')[0];
+  db.transactions = db.transactions.filter(t =>
+    !(t.installment?.purchaseId === req.params.id && t.date > today)
+  );
+  writeDb(db);
+  res.json({ success: true });
+});
+
+/* ═════════════════ Settings ═════════════════ */
 app.put('/api/settings', (req, res) => {
   const db = readDb();
   db.settings = { ...db.settings, ...req.body };
@@ -153,9 +413,14 @@ app.put('/api/settings', (req, res) => {
   res.json(db.settings);
 });
 
-// Gemini AI Statement Parser Endpoint
+/* ═════════════════ Gemini AI — Statement Parser ═════════════════
+   A IA só faz o que só ela pode fazer: interpretar texto não
+   estruturado. Categoria final é sempre reconciliada com as
+   categoryRules (determinístico) antes de responder, e parcelas
+   da mesma compra são agrupadas automaticamente numa Purchase.
+─────────────────────────────────────────────────────────────── */
 app.post('/api/analyze-statement', async (req, res) => {
-  const { text } = req.body;
+  const { text, defaultPerson } = req.body;
   if (!text) {
     return res.status(400).json({ error: "O texto do extrato é obrigatório." });
   }
@@ -166,6 +431,7 @@ app.post('/api/analyze-statement', async (req, res) => {
   }
 
   try {
+    const db = readDb();
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
@@ -185,6 +451,7 @@ Para cada transação encontrada, você deve identificar:
    - "Reserva Financeira" (aportes, investimentos, poupança)
    - "Outros" (gastos eventuais)
    - "Receita" (salários, rendimentos, pix recebido)
+5. Se a descrição indicar parcelamento (ex: "Parcela 3/12"), extraia installmentNumber e installmentTotal como números. Caso contrário, use null nos dois.
 
 Retorne APENAS um array JSON válido (sem markdown, sem explicações adicionais, sem bloco de código triplo. Apenas o array de objetos puramente).
 Cada objeto deve ter a estrutura:
@@ -193,7 +460,9 @@ Cada objeto deve ter a estrutura:
   "description": "Nome limpo do estabelecimento",
   "amount": -150.00,
   "category": "Alimentação",
-  "type": "expense" (ou "income")
+  "type": "expense" (ou "income"),
+  "installmentNumber": null,
+  "installmentTotal": null
 }
 
 Texto do extrato:
@@ -203,21 +472,31 @@ ${text}
 
     const result = await model.generateContent(prompt);
     const responseText = result.response.text().trim();
-    
-    // Clean up potential markdown formatting that Gemini might output
+
     let cleanJson = responseText;
-    if (cleanJson.startsWith('```json')) {
-      cleanJson = cleanJson.slice(7);
-    }
-    if (cleanJson.startsWith('```')) {
-      cleanJson = cleanJson.slice(3);
-    }
-    if (cleanJson.endsWith('```')) {
-      cleanJson = cleanJson.slice(0, -3);
-    }
+    if (cleanJson.startsWith('```json')) cleanJson = cleanJson.slice(7);
+    if (cleanJson.startsWith('```')) cleanJson = cleanJson.slice(3);
+    if (cleanJson.endsWith('```')) cleanJson = cleanJson.slice(0, -3);
     cleanJson = cleanJson.trim();
 
-    const transactions = JSON.parse(cleanJson);
+    const rawTransactions = JSON.parse(cleanJson);
+
+    // Reconciliação determinística: se existe uma regra de categoria
+    // pro merchant, ela vence o palpite da IA — reduz a categorização
+    // divergente que gerava os scripts fix_*.js manuais.
+    const person = defaultPerson || 'conjunta';
+    const transactions = rawTransactions.map(t => {
+      const ruleCategory = applyCategoryRules(t.description, db.categoryRules, null);
+      return {
+        ...t,
+        category: ruleCategory || t.category,
+        person,
+        installment: (t.installmentNumber && t.installmentTotal)
+          ? { number: t.installmentNumber, total: t.installmentTotal }
+          : null
+      };
+    });
+
     res.json({ transactions });
   } catch (error) {
     console.error("Erro ao analisar extrato com Gemini:", error);
@@ -225,75 +504,67 @@ ${text}
   }
 });
 
-// Gemini AI Financial Coach Advice Endpoint
+/* ═════════════════ Gemini AI — Coach (agora só narra) ═════════════════
+   O cálculo sai daqui. computeMetrics() já fez toda a aritmética antes
+   de qualquer chamada à IA — o Gemini recebe números prontos e só
+   comenta em cima deles. Isso é mais barato, mais rápido, e elimina
+   o risco de a IA "errar conta" no meio do relatório.
+──────────────────────────────────────────────────────────────────── */
 app.post('/api/coach-advice', async (req, res) => {
   const db = readDb();
+  const metrics = computeMetrics(db);
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ error: "Chave da API do Gemini não configurada no servidor." });
+    // Mesmo sem IA disponível, os números determinísticos continuam
+    // úteis — devolve metrics para o painel exibir de qualquer forma.
+    return res.status(200).json({ advice: null, metrics, aiUnavailable: true });
   }
 
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-    // Prepare data summary for Gemini
-    const transactionsSummary = db.transactions.map(t => `${t.date}: ${t.description} | ${t.category} | R$ ${t.amount.toFixed(2)}`).join('\n');
     const goalsSummary = db.goals.map(g => `${g.name}: R$ ${g.currentAmount.toFixed(2)} de R$ ${g.targetAmount.toFixed(2)} (Prazo: ${g.deadline})`).join('\n');
-    const budgets = db.settings.categoryBudgets;
-    const settingsSummary = `Orçamento Mensal Total: R$ ${db.settings.monthlyBudget}
-Limites Planejados:
-- Moradia: R$ ${budgets.moradia}
-- Alimentação: R$ ${budgets.alimentacao}
-- Transporte: R$ ${budgets.transporte}
-- Saúde: R$ ${budgets.saude}
-- Lazer: R$ ${budgets.lazer}
-- Reserva Financeira: R$ ${budgets.reserva}
-- Outros: R$ ${budgets.outros}`;
 
-    const prompt = `Você é um Consultor Financeiro Pessoal analítico, objetivo e focado em otimização de orçamento e investimentos reais.
-Com base nos dados financeiros da pessoa abaixo, elabore um relatório de planejamento financeiro, identificando gargalos, oportunidades de melhoria e recomendações.
+    const prompt = `Você é um Consultor Financeiro Pessoal analítico e objetivo.
+Os números abaixo JÁ FORAM CALCULADOS pelo sistema — não recalcule nada, não invente números diferentes. Use exatamente estes valores para comentar, diagnosticar gargalos e recomendar ações.
 
-DADOS DA PESSOA:
----
-${settingsSummary}
+MÉTRICAS DO PERÍODO (JSON):
+${JSON.stringify(metrics, null, 2)}
 
 METAS ATUAIS:
-${goalsSummary}
+${goalsSummary || 'Nenhuma meta cadastrada.'}
 
-TRANSAÇÕES REGISTRADAS:
-${transactionsSummary}
----
+Estruture sua resposta em Markdown, abordando:
+1. **Diagnóstico**: leitura dos números acima — orçado vs. realizado, maiores gargalos, parcelamentos em aberto que pesam no fluxo.
+2. **Recomendações práticas**: ações específicas, priorizadas pelo maior impacto.
+3. **Plano de metas**: como usar o saldo/reserva disponível pra avançar nas metas cadastradas.
 
-Por favor, estruture seu conselho com clareza e objetividade, abordando:
-1. **Diagnóstico do Fluxo Financeiro**: Como está o equilíbrio entre o planejado vs gasto em cada categoria. Identifique onde estão os maiores gargalos.
-2. **Recomendações Práticas**: Dicas específicas e acionáveis sobre como economizar ou otimizar o orçamento.
-3. **Plano de Investimentos**: Sugira estratégias de investimentos e realocação de recursos para atingir as metas no prazo estipulado (ex: renda fixa, reserva de emergência, etc.).
-
-Retorne o resultado formatado em Markdown claro e profissional, com uma linguagem encorajadora mas técnica.`;
+Não repita os números em tabela — eles já aparecem no painel. Foque em interpretação e recomendação.`;
 
     const result = await model.generateContent(prompt);
-    res.json({ advice: result.response.text() });
+    res.json({ advice: result.response.text(), metrics });
   } catch (error) {
     console.error("Erro ao gerar conselho financeiro com Gemini:", error);
-    res.status(500).json({ error: "Falha ao gerar orientações da IA: " + error.message });
+    // Falha na IA não deve derrubar os números determinísticos.
+    res.status(200).json({ advice: null, metrics, aiError: error.message });
   }
 });
 
-// Setup Frontend Integration
+/* ═════════════════ Frontend Integration ═════════════════ */
 const isProd = process.env.NODE_ENV === 'production';
 
 if (!isProd) {
-  // Integrate Vite Dev Server in development mode
   console.log("Iniciando em ambiente de Desenvolvimento...");
   const { createServer: createViteServer } = await import('vite');
-  
+
   const vite = await createViteServer({
     server: { middlewareMode: true },
     appType: 'custom',
     root: __dirname
   });
-  
+
   app.use(vite.middlewares);
 
   app.use(async (req, res, next) => {
@@ -310,17 +581,15 @@ if (!isProd) {
     }
   });
 } else {
-  // Serve static build files in production mode
   console.log("Iniciando em ambiente de Produção...");
   const distPath = path.join(__dirname, 'dist');
   app.use(express.static(distPath));
-  
-  app.get('*', (req, res) => {
+
+  app.get('/*splat', (req, res) => {
     res.sendFile(path.join(distPath, 'index.html'));
   });
 }
 
-// Start Server
 app.listen(PORT, () => {
   console.log(`🚀 Servidor rodando com sucesso em: http://localhost:${PORT}`);
 });
