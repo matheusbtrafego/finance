@@ -4,7 +4,7 @@ import {
   FileText, PiggyBank, Compass, Settings as SettingsIcon,
   Plus, Trash2, RefreshCw, Check, AlertCircle, BookOpen,
   ArrowUpRight, ArrowDownRight, Layers, ChevronRight, ChevronDown, ChevronUp,
-  Sparkles, X
+  Sparkles, X, ClipboardList
 } from 'lucide-react';
 
 /* ─── Constantes ─────────────────────────────────────── */
@@ -79,7 +79,7 @@ function parseOFX(text, rules) {
 ════════════════════════════════════════════════════════ */
 export default function App() {
   const [tab, setTab] = useState('dashboard');
-  const [data, setData] = useState({ transactions: [], goals: [], purchases: [], categoryRules: [], settings: {} });
+  const [data, setData] = useState({ transactions: [], goals: [], purchases: [], categoryRules: [], planItems: [], settings: {} });
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState(null);
@@ -106,6 +106,9 @@ export default function App() {
   // Regra de categorização
   const [ruleKeyword,  setRuleKeyword]  = useState('');
   const [ruleCategory, setRuleCategory] = useState('Outros');
+
+  // Plano de Ação — um "novo item" pendente por seção
+  const [newPlanItem, setNewPlanItem] = useState({ entrada: '', fixo: '', cartao: '', reserva: '' });
 
   // Goal form
   const [gName,     setGName]     = useState('');
@@ -228,6 +231,20 @@ export default function App() {
 
   const deleteRule = async (id) => { await del(`/api/category-rules/${id}`); fetchData(); };
 
+  /* ── Plano de Ação: planilha editável (entrada/fixo/cartão/reserva) ── */
+  const addPlanItem = async (section) => {
+    const name = (newPlanItem[section] || '').trim();
+    if (!name) return;
+    await postJSON('/api/plan-items', { section, name, amount: 0 });
+    setNewPlanItem(prev => ({ ...prev, [section]: '' }));
+    fetchData();
+  };
+  const updatePlanItem = async (id, field, value) => {
+    await putJSON(`/api/plan-items/${id}`, { [field]: value });
+    fetchData();
+  };
+  const deletePlanItem = async (id) => { await del(`/api/plan-items/${id}`); fetchData(); };
+
   /* ── Reclassificação rápida (usada na fila de classificação) ── */
   const reclassify = async (id, category) => { await putJSON(`/api/transactions/${id}`, { category }); fetchData(); };
   const reassignPerson = async (id, person) => { await putJSON(`/api/transactions/${id}`, { person }); fetchData(); };
@@ -347,6 +364,10 @@ export default function App() {
   ════════════════════════════════════════════════════ */
   const TABS = [
     { id: 'dashboard', icon: <Compass size={13}/>,      label: 'Painel'         },
+    // 'plano' (Plano de Ação) fica de fora do nav por enquanto — backend
+    // (/api/plan-items, planSummary) já está pronto, só falta a aba no
+    // painel. Retomar: adicionar { id:'plano', icon:<ClipboardList size={13}/>, label:'Plano de Ação' }
+    // aqui e o bloco `{tab === 'plano' && (...)}` no render.
     { id: 'income-strategy', icon: <TrendingUp size={13}/>, label: 'Inteligência de Renda' },
     { id: 'history',   icon: <Layers size={13}/>,       label: 'Extrato'        },
     { id: 'installments', icon: <FileText size={13}/>,  label: 'Parcelamentos'  },

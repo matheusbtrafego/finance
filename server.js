@@ -77,12 +77,49 @@ const DEFAULT_CATEGORY_RULES = [
   { id: 'r34', keyword: 'reembolso',     category: 'Reembolsos' },
 ];
 
+// Plano de Ação: separa o que já se SABE que vai pagar (entrada,
+// custo fixo, cartão) da reserva (que é saldo acumulado, não fluxo
+// mensal). É a "planilha bonita" — editável no painel, sem precisar
+// reconstruir isso em texto a cada conversa. Seed = último cenário
+// fechado na análise.
+const DEFAULT_PLAN_ITEMS = [
+  // ── Entradas ──
+  { id: 'pe1', section: 'entrada', name: 'Cliente',             amount: 1200 },
+  { id: 'pe2', section: 'entrada', name: 'Agência',             amount: 1200 },
+  { id: 'pe3', section: 'entrada', name: 'Agência',             amount: 700 },
+  { id: 'pe4', section: 'entrada', name: 'Agência',             amount: 1000 },
+  { id: 'pe5', section: 'entrada', name: 'Agência',             amount: 1500 },
+  { id: 'pe6', section: 'entrada', name: 'Agência / Parceria',  amount: 3600 },
+  { id: 'pe7', section: 'entrada', name: 'Babá',                amount: 1200 },
+  // ── Custos fixos ──
+  { id: 'pf1',  section: 'fixo', name: 'Moradia — Aluguel + IPTU',       amount: 1936.81 },
+  { id: 'pf2',  section: 'fixo', name: 'Moradia — Condomínio',           amount: 721.83 },
+  { id: 'pf3',  section: 'fixo', name: 'Moradia — Luz',                  amount: 160.01 },
+  { id: 'pf4',  section: 'fixo', name: 'Moradia — Internet (residencial)', amount: 129.72 },
+  { id: 'pf5',  section: 'fixo', name: 'Moradia — Internet (linha extra)', amount: 59 },
+  { id: 'pf6',  section: 'fixo', name: 'Moradia — Internet (linha extra)', amount: 67 },
+  { id: 'pf7',  section: 'fixo', name: 'Carro — Parcela',                amount: 2250 },
+  { id: 'pf8',  section: 'fixo', name: 'Carro — Seguro',                 amount: 700 },
+  { id: 'pf9',  section: 'fixo', name: 'Carro — Manutenção (média)',     amount: 1500 },
+  { id: 'pf10', section: 'fixo', name: 'Alimentação',                   amount: 1000 },
+  { id: 'pf11', section: 'fixo', name: 'Assinatura — Claude',            amount: 110 },
+  { id: 'pf12', section: 'fixo', name: 'Assinatura — Gemini',            amount: 25 },
+  { id: 'pf13', section: 'fixo', name: 'Assinatura — Netflix',           amount: 20 },
+  { id: 'pf14', section: 'fixo', name: 'Assinatura — Gigo',              amount: 19 },
+  { id: 'pf15', section: 'fixo', name: 'Assinatura — Servidor',          amount: 30 },
+  // ── Cartão de crédito ──
+  { id: 'pc1', section: 'cartao', name: 'Cartão de crédito (projeção)',  amount: 250 },
+  // ── Reserva ──
+  { id: 'pr1', section: 'reserva', name: 'Reserva de emergência',       amount: 10000 },
+];
+
 const initialDb = {
   transactions: [],
   goals: [],
   purchases: [],
   people: DEFAULT_PEOPLE,
   categoryRules: DEFAULT_CATEGORY_RULES,
+  planItems: DEFAULT_PLAN_ITEMS,
   settings: {
     familyName: "Usuário",
     monthlyBudget: 10000,
@@ -110,6 +147,7 @@ function readDb() {
     if (!db.purchases) db.purchases = [];
     if (!db.people) db.people = DEFAULT_PEOPLE;
     if (!db.categoryRules) db.categoryRules = DEFAULT_CATEGORY_RULES;
+    if (!db.planItems) db.planItems = DEFAULT_PLAN_ITEMS;
     return db;
   } catch (err) {
     console.error("Erro ao ler db.json, usando dados iniciais:", err);
@@ -220,6 +258,33 @@ function computeMetrics(db) {
     t.type === 'expense' && (t.category === 'Outros' || t.category === 'Outras Despesas' || !t.person)
   );
 
+  // Plano de Ação: a "planilha" que o usuário edita no painel —
+  // separa o que já se sabe que tem que pagar (entrada, fixo,
+  // cartão) da reserva, que é saldo acumulado, não fluxo mensal.
+  // Tudo somado aqui, zero IA.
+  const planItems = db.planItems || [];
+  const planBySection = { entrada: [], fixo: [], cartao: [], reserva: [] };
+  planItems.forEach(p => {
+    if (!planBySection[p.section]) planBySection[p.section] = [];
+    planBySection[p.section].push(p);
+  });
+  const planTotal = (section) => (planBySection[section] || []).reduce((s, p) => s + (p.amount || 0), 0);
+  const planEntradas = planTotal('entrada');
+  const planFixo     = planTotal('fixo');
+  const planCartao   = planTotal('cartao');
+  const planReserva  = planTotal('reserva');
+  const planComprometido = planFixo + planCartao;
+  const planSummary = {
+    bySection: planBySection,
+    entradas: planEntradas,
+    fixo: planFixo,
+    cartao: planCartao,
+    reserva: planReserva,
+    comprometido: planComprometido,
+    saldo: planEntradas - planComprometido,
+    mesesDeReserva: planComprometido > 0 ? planReserva / planComprometido : 0
+  };
+
   return {
     totalIncome, totalExpense, netBalance,
     savingsRate: totalIncome > 0 ? Math.max(0, netBalance / totalIncome * 100) : 0,
@@ -231,7 +296,8 @@ function computeMetrics(db) {
       count: unclassified.length,
       total: sum(unclassified),
       items: unclassified
-    }
+    },
+    planSummary
   };
 }
 
@@ -339,6 +405,47 @@ app.delete('/api/category-rules/:id', (req, res) => {
   db.categoryRules = db.categoryRules.filter(r => r.id !== req.params.id);
   writeDb(db);
   res.json({ success: true });
+});
+
+/* ═════════════════ Plano de Ação ═════════════════
+   A "planilha" editável do painel: entrada / fixo / cartão / reserva.
+   CRUD simples — os totais e o saldo são sempre recalculados em
+   computeMetrics() a partir desses itens, nunca digitados à mão. */
+app.post('/api/plan-items', (req, res) => {
+  const db = readDb();
+  const item = {
+    id: Date.now().toString(),
+    section: req.body.section || 'fixo', // entrada | fixo | cartao | reserva
+    name: (req.body.name || '').trim(),
+    amount: parseFloat(req.body.amount || 0)
+  };
+  if (!item.name) return res.status(400).json({ error: 'name é obrigatório' });
+  db.planItems.push(item);
+  writeDb(db);
+  res.status(201).json(item);
+});
+
+app.put('/api/plan-items/:id', (req, res) => {
+  const db = readDb();
+  const index = db.planItems.findIndex(p => p.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Item não encontrado' });
+  const updated = { ...db.planItems[index], ...req.body, id: req.params.id };
+  if (req.body.amount !== undefined) updated.amount = parseFloat(req.body.amount) || 0;
+  db.planItems[index] = updated;
+  writeDb(db);
+  res.json(updated);
+});
+
+app.delete('/api/plan-items/:id', (req, res) => {
+  const db = readDb();
+  const initialLength = db.planItems.length;
+  db.planItems = db.planItems.filter(p => p.id !== req.params.id);
+  if (db.planItems.length < initialLength) {
+    writeDb(db);
+    res.json({ success: true });
+  } else {
+    res.status(404).json({ error: 'Item não encontrado' });
+  }
 });
 
 /* ═════════════════ Purchases (parcelamento) ═════════════════
